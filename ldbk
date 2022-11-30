@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+import datetime
+import logging
+import tempfile
+import uuid
+
+from ldskbkp.util.logger import get_logger
+
+logger = get_logger(logfile=False)
+run_uuid = str(uuid.uuid4())
+
+import argparse
+import os
+
+from ldskbkp.util.cli import ask_yn
+from ldskbkp.util.misc import get_ldbk_database
+from ldskbkp.database.connection import initialize
+
+version = "0.0.1"
+database_version = "1"
+run_start = datetime.datetime.now()
+
+db = None
+workdir = None
+
+parser = argparse.ArgumentParser(prog='ldskbkp',
+                                 description='A backup solution targeting cd/dvd/blu-ray/iso drives as storage media.',
+                                 epilog='ldbkp {} by Locchan <locchan@protonmail.com>'.format(version))
+group = parser.add_mutually_exclusive_group()
+group.add_argument('--index-only', help="Just index files and exit.", action="store_true", required=False)
+group.add_argument('--iso-only', help="Just create ISOs, do not burn anything", action="store_true", required=False)
+group.add_argument('--custom-disk-size', help="Custom disk size (in bytes).", required=False, type=int)
+group.add_argument('--disk-type', help="Type of backup disk", required=False)
+
+parser.add_argument('--path', help="Path to the directory to work in", required=True)
+parser.add_argument('--version', help="Version", action="store_true", required=False)
+parser.add_argument('--create-log', help="Create a log file", action="store_true", required=False)
+parser.add_argument('--log-path', help="Path for a log file (defaults to backup directory)."
+                                       "Ignored if --create-log is not specified", required=False)
+parser.add_argument('--database-path', help="Path to ldbk database", required=False)
+parser.add_argument('--verbose', action='store_true', required=False)
+
+args = parser.parse_args()
+
+if args.version:
+    logger.info("ldbkp {} by Locchan <locchan@protonmail.com>.".format(version))
+    exit(0)
+
+if args.path:
+    workdir = args.path
+else:
+    workdir = os.getcwd()
+
+logdir = workdir
+if args.log_path:
+    newlogpath = args.log_path
+    if os.path.exists(os.path.dirname(newlogpath)):
+        if os.access(newlogpath, os.W_OK):
+            logdir = newlogpath
+        else:
+            logger.warning("Can't write logs! Insufficient permissions.")
+    else:
+        logger.warning("Can't write logs! Non-existent path.")
+
+if args.verbose:
+    logger = get_logger(logfile=args.create_log, level=logging.DEBUG, logpath=logdir)
+else:
+    logger = get_logger(logfile=args.create_log, level=logging.INFO, logpath=logdir)
+
+logger.debug("Running in verbose mode...")
+logger.debug("Working in {}".format(workdir))
+logger.debug("Getting database...")
+
+if args.database_path:
+    database_exists, database_path = get_ldbk_database(args.database_path)
+else:
+    database_exists, database_path = get_ldbk_database(workdir)
+
+if not database_exists:
+    logger.info("Database file does not exist")
+    if not ask_yn("Do you want to create a new database for this directory and all its subdirectories"):
+        logger.info("Can't proceed without a database. Exiting...")
+        exit(0)
+    db = initialize(database_path)
+    from ldskbkp.database.utils import initialize_new_db
+    initialize_new_db()
+    logger.info("A new database is initialized.")
+else:
+    db = initialize(database_path)
+    from ldskbkp.database.utils import validate_db, initialize_new_db
+
+    database_valid = validate_db()
+    if not database_valid:
+        logger.error("Database file is invalid or corrupt! Cannot proceed, exiting...")
+        exit(1)
+
+from ldskbkp.filemgr.file_indexer import register_files
+
+logger.info("Indexing files...")
+files_new, files_changed, files_deleted, errors = register_files(workdir)
+logger.info("Done indexing. There are {} new files; {} changed files and {} deleted files".format(
+    len(files_new), len(files_changed), len(files_deleted)
+))
+if len(errors) != 0:
+    report_path = os.path.join(tempfile.gettempdir(), "ldbk_errors_{}".format(run_start.timestamp()))
+    with open(report_path, "w") as error_report:
+        error_report.write("Errors:\n")
+        for anerror in errors:
+            error_report.write("{}: {}\n".format(anerror[0], anerror[1]))
+    logger.warning("Indexing finished with {} errors. Error report is saved here: {}".format(len(errors), report_path))
+
+if args.index_only:
+    exit(0)
